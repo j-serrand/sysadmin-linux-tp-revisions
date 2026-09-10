@@ -22,11 +22,14 @@ titre() {
 ok() {
     local desc="$1"; shift
     TOTAL=$((TOTAL + 1))
+    DETAIL=""
     if "$@" >/dev/null 2>&1; then
         echo -e "  [${VERT}OK${RAZ}]     $desc"
         SCORE=$((SCORE + 1))
     else
         echo -e "  [${ROUGE}ECHEC${RAZ}]  $desc"
+        # DETAIL est renseigne par certaines fonctions de test (contenu_conforme)
+        [ -n "$DETAIL" ] && echo -e "${JAUNE}${DETAIL}${RAZ}"
     fi
 }
 
@@ -60,16 +63,78 @@ perms() {
     [ "$reel" = "$attendu $prop $grp" ]
 }
 
-# contenu_conforme <repertoire> <octal> <proprietaire> <groupe>
-# verifie que le repertoire n'est pas vide et que TOUS ses fichiers sont conformes
+# perms_fichier_attendues <octal_du_dossier>
+# Un fichier n'a pas a porter le bit d'execution du dossier : sur un dossier, x
+# autorise la traversee, sur un fichier il le rend executable. On accepte donc
+# pour chaque triplet la valeur du dossier, ou cette valeur sans le bit x.
+# Exemple : dossier 775 -> fichiers 775 ou 664 (et les combinaisons par triplet).
+perms_fichier_attendues() {
+    local oct="$1"
+    local u=${oct:0:1} g=${oct:1:1} o=${oct:2:1}
+    local lu lg lo
+    for lu in "$u" "$((u & ~1))"; do
+        for lg in "$g" "$((g & ~1))"; do
+            for lo in "$o" "$((o & ~1))"; do
+                echo "$lu$lg$lo"
+            done
+        done
+    done | sort -u
+}
+
+# contenu_conforme <repertoire> <octal_du_dossier> <proprietaire> <groupe>
+# Verifie que le repertoire n'est pas vide, et que TOUT son contenu (fichiers ET
+# sous-dossiers) appartient au bon proprietaire et au bon groupe, avec des
+# permissions coherentes. Les ecarts sont listes dans la variable DETAIL.
 contenu_conforme() {
     local rep="$1" attendu="$2" prop="$3" grp="$4"
-    [ -d "$rep" ] || return 1
+    DETAIL=""
+    [ -d "$rep" ] || { DETAIL="le repertoire n'existe pas"; return 1; }
+
     local nb
-    nb=$(find "$rep" -type f | wc -l)
-    [ "$nb" -gt 0 ] || return 1
-    local mauvais
-    mauvais=$(find "$rep" -type f ! \( -perm "$attendu" -user "$prop" -group "$grp" \) | wc -l)
+    nb=$(find "$rep" -type f 2>/dev/null | wc -l)
+    if [ "$nb" -eq 0 ]; then
+        DETAIL="aucun fichier dans le repertoire (fichiers non deplaces ?)"
+        return 1
+    fi
+
+    # Permissions acceptees pour les fichiers (avec ou sans le bit x)
+    local ok_fichier
+    ok_fichier=$(perms_fichier_attendues "$attendu")
+
+    local chemin type_e mode user group souci
+    local mauvais=0
+    while IFS='|' read -r chemin type_e mode user group; do
+        [ -z "$chemin" ] && continue
+        souci=""
+        [ "$user" != "$prop" ] && souci="proprietaire=$user (attendu $prop)"
+        if [ "$group" != "$grp" ]; then
+            [ -n "$souci" ] && souci="$souci, "
+            souci="${souci}groupe=$group (attendu $grp)"
+        fi
+        if [ "$type_e" = "d" ]; then
+            # un sous-dossier doit porter exactement les permissions du dossier parent
+            if [ "$mode" != "$attendu" ]; then
+                [ -n "$souci" ] && souci="$souci, "
+                souci="${souci}permissions=$mode (attendu $attendu)"
+            fi
+        else
+            if ! grep -qx "$mode" <<< "$ok_fichier"; then
+                [ -n "$souci" ] && souci="$souci, "
+                souci="${souci}permissions=$mode (attendu $(tr '\n' '/' <<< "$ok_fichier" | sed 's:/$::'))"
+            fi
+        fi
+        if [ -n "$souci" ]; then
+            mauvais=$((mauvais + 1))
+            [ "$mauvais" -le 3 ] && DETAIL="${DETAIL}
+             -> $chemin : $souci"
+        fi
+    done < <(find "$rep" -mindepth 1 \( -type f -o -type d \) -exec stat -c '%n|%F|%a|%U|%G' {} + 2>/dev/null |
+             sed 's/|directory|/|d|/; s/|regular file|/|f|/; s/|regular empty file|/|f|/')
+
+    if [ "$mauvais" -gt 3 ]; then
+        DETAIL="${DETAIL}
+             -> ... et $((mauvais - 3)) autre(s) element(s) non conforme(s)"
+    fi
     [ "$mauvais" -eq 0 ]
 }
 
@@ -85,17 +150,17 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 # --------------------------------------------------------------------
-titre "Mission 4 - Groupes"
+titre "Mission 5 - Groupes"
 for g in gaulois druides guerriers bardes romains; do
     ok "groupe $g existe" groupe_existe "$g"
 done
 
-titre "Mission 4 - Utilisateurs"
+titre "Mission 5 - Utilisateurs"
 for u in asterix obelix panoramix assurancetourix jules; do
     ok "utilisateur $u existe" user_existe "$u"
 done
 
-titre "Mission 4 - Appartenance aux groupes"
+titre "Mission 5 - Appartenance aux groupes"
 ok "asterix dans gaulois"            user_dans_groupe asterix gaulois
 ok "asterix dans guerriers"          user_dans_groupe asterix guerriers
 ok "asterix dans sudo"               user_dans_groupe asterix sudo
@@ -110,7 +175,7 @@ ok "jules dans romains"              user_dans_groupe jules romains
 pas_ok "jules PAS dans sudo"         user_dans_groupe jules sudo
 
 # --------------------------------------------------------------------
-titre "Mission 5 - Repertoires, proprietaires et permissions"
+titre "Mission 6 - Repertoires, proprietaires et permissions"
 ok "/village/place        775 asterix:gaulois"          perms /village/place  775 asterix gaulois
 ok "/village/huttes       750 asterix:gaulois"          perms /village/huttes 750 asterix gaulois
 ok "/village/potion       750 panoramix:druides"        perms /village/potion 750 panoramix druides
@@ -118,7 +183,7 @@ ok "/village/armes        770 obelix:guerriers"         perms /village/armes  77
 ok "/village/chants       754 assurancetourix:bardes"   perms /village/chants 754 assurancetourix bardes
 ok "/camp-romain          750 jules:romains"            perms /camp-romain    750 jules romains
 
-titre "Mission 5 - Contenu des repertoires (recursivite)"
+titre "Mission 6 - Contenu des repertoires (recursivite)"
 ok "/village/place  : fichiers presents et conformes"   contenu_conforme /village/place  775 asterix gaulois
 ok "/village/potion : fichiers presents et conformes"   contenu_conforme /village/potion 750 panoramix druides
 ok "/village/armes  : fichiers presents et conformes"   contenu_conforme /village/armes  770 obelix guerriers
@@ -126,12 +191,18 @@ ok "/village/chants : fichiers presents et conformes"   contenu_conforme /villag
 ok "/camp-romain    : fichiers presents et conformes"   contenu_conforme /camp-romain    750 jules romains
 
 # --------------------------------------------------------------------
-titre "Mission 6 - Reseau"
+titre "Mission 7 - Reseau"
 
 IFACE=$(ip -o -4 route show default | awk '{print $5}' | head -1)
 IP_CIDR=$(ip -o -4 addr show dev "$IFACE" 2>/dev/null | awk '{print $4}' | head -1)
 GW=$(ip -o -4 route show default | awk '{print $3}' | head -1)
-DNS=$(resolvectl dns "$IFACE" 2>/dev/null | awk -F': ' '{print $2}' | tr -d ' ')
+# Le DNS peut etre declare sur l'interface (Link) ou globalement (Global) :
+# on collecte les deux, sinon un DNS correct mais global passe pour absent.
+DNS=$( { resolvectl dns "$IFACE" 2>/dev/null; resolvectl status 2>/dev/null | grep -i 'DNS Servers'; } |
+       grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u | tr '\n' ' ' | sed 's/ $//')
+# Repli si resolvectl est absent ou muet
+[ -z "$DNS" ] && DNS=$(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null |
+                       awk '{print $2}' | grep -v '^127\.' | sort -u | tr '\n' ' ' | sed 's/ $//')
 
 echo "  Interface : ${IFACE:-inconnue}"
 echo "  Adresse   : ${IP_CIDR:-aucune}"
@@ -152,7 +223,7 @@ ok "DNS = 192.168.100.10"          grep -q '192\.168\.100\.10' <<< "$DNS"
 ok "DHCP desactive dans netplan"   grep -rqE 'dhcp4:[[:space:]]*(false|no)' /etc/netplan/
 ok "passerelle joignable (ping)"   ping -c 2 -W 2 "$GW"
 
-titre "Mission 6 - Utilisateur pigeon"
+titre "Mission 7 - Utilisateur pigeon"
 ok "utilisateur pigeon existe"     user_existe pigeon
 pas_ok "pigeon PAS dans sudo"      user_dans_groupe pigeon sudo
 ok "serveur SSH actif"             systemctl is-active --quiet ssh
